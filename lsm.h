@@ -8,7 +8,10 @@ typedef struct
     Oid base;                        // Oid of base index
     Oid heap;                        // Oid of indexed relation
     Oid top_indices[2];              // Oid of 2 top indices
+    int access_count[2];             // Access counter
     int active_index;                // Current active index from the two top indices
+    uint64 n_merges;                 // #merges since database start
+    uint64 n_inserts;                // #inserts since database start
     volatile bool start_merge;       // start compaction of top index with base index
     volatile bool merge_in_progress; // merge is in progress?
     PGPROC *compactor;               // compactor daemon
