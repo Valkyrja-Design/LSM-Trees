@@ -48,11 +48,19 @@ PG_FUNCTION_INFO_V1(lsm_nbtree_wrapper);
 extern void _PG_init(void);
 extern void _PG_fini(void);
 
+/* 
+	Hash table provided by Postgres 
+	https://github.com/postgres/postgres/blob/master/src/backend/utils/hash/dynahash.c
+*/
 static HTAB *lsm_map;		 // maps relation Oid to control structure (lsm_entry)
+/*
+	Lightweight Lock, provides shared and exclusive access modes
+	https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/lwlock.c
+*/
 static LWLock *lsm_map_lock; // lock for access to lsm_map
-static List *lsm_released_locks;
+// static List *lsm_released_locks;
 static List *lsm_entries;
-static bool lsm_inside_copy;
+// static bool lsm_inside_copy;
 
 // relation option kind for our index
 static relopt_kind lsm_relopt_kind;
@@ -61,6 +69,7 @@ static relopt_kind lsm_relopt_kind;
 static int lsm_max_indices;
 static int lsm_top_index_size;
 
+/* See : https://pgpedia.info/h/hooks.html */
 // Previous hooks
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -70,7 +79,7 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 #endif
 static ExecutorFinish_hook_type prev_executor_finish_hook = NULL;
 
-// background daemon termination flag
+// background compactor daemon termination flag
 static volatile bool lsm_terminate;
 
 // Our custom shared memory request function (hook) to reserve space for control data of all the indices
@@ -122,13 +131,17 @@ static void lsm_init_entry(lsm_entry *entry, Relation index)
 	SpinLockInit(&entry->spinlock);
 	entry->active_index = 0;
 	entry->compactor = NULL;
-	entry->merge_in_progress = false;
-	entry->start_merge = false;
-	entry->n_merges = 0;
-	entry->n_inserts = 0;
+	// entry->merge_in_progress = false;
+	// entry->start_merge = false;
+	// entry->n_merges = 0;
+	// entry->n_inserts = 0;
 	entry->top_indices[0] = entry->top_indices[1] = InvalidOid;
-	// rd_index is a tuple describing this index and we use it to fetch Oid of index
-	entry->heap = index->rd_index->indrelid;
+	/* 
+		rd_index is a tuple describing this index and we use it to fetch Oid of the relation it indexes 
+		Relation : https://github.com/postgres/postgres/blob/master/src/include/utils/rel.h
+		Form_pg_index : https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_index.h
+	*/
+	entry->heap = index->rd_index->indrelid;	
 	entry->db_id = MyDatabaseId;
 	entry->user_id = GetUserId();
 	entry->top_index_size = index->rd_options ? ((lsm_options *)index->rd_options)->top_index_size : 0;
@@ -167,7 +180,7 @@ static lsm_entry *lsm_get_entry(Relation index)
 	{
 		char *relname = RelationGetRelationName(index);
 		lsm_init_entry(entry, index);
-		// set Oids of top indices, named as relname_top{n}
+		// set Oids of top indices, named as {relname}_top{n}
 		for (int i = 0; i < 2; i++)
 		{
 			// psprintf similar to sprintf but returns buffer with string
@@ -176,7 +189,7 @@ static lsm_entry *lsm_get_entry(Relation index)
 			entry->top[i] = get_relname_relid(top_idx_name, RelationGetNamespace(index));
 			// couldn't fetch
 			if (entry->top[i] == InvalidOid)
-				elog(ERROR, "LSM: failed to lookup index %s", top_idx_name);
+				elog(ERROR, "LSM: failed to find index %s", top_idx_name);
 		}
 		// active index is one with more entries from the two
 		entry->active_index = lsm_get_index_size(entry->top[0]) >= lsm_get_index_size(entry->top[1]) ? 0 : 1;
@@ -200,6 +213,8 @@ static void lsm_truncate_index(Oid index_oid, Oid heap_oid)
 						IndexInfo *indexInfo,
 						bool isreindex,
 						bool parallel)
+		isreindex indicates we are recreating a previously-existing index
+		https://github.com/postgres/postgres/blob/master/src/backend/catalog/index.c
 	*/
 	index_build(heap, index, indexInfo, true, false);
 	index_close(index, AccessExclusiveLock);
@@ -213,7 +228,7 @@ static void lsm_truncate_index(Oid index_oid, Oid heap_oid)
 #define INSERT_FLAGS false
 #endif
 
-// constructing
+// constructing lsm_options from reloptions
 static bytea *lsm_get_options(Datum reloptions, bool validate)
 {
 	static const relopt_parse_elt tab[] = {
@@ -221,8 +236,12 @@ static bytea *lsm_get_options(Datum reloptions, bool validate)
 		{"vacuum_cleanup", RELOPT_TYPE_REAL, offsetof(BTOptions, vacuum_cleanup_index_scale_factor)},
 		{"deduplicate_items", RELOPT_TYPE_BOOL, offsetof(BTOptions, deduplicate_items)},
 		{"top_index_size", RELOPT_TYPE_INT, offsetof(lsm_options, top_index_size)},
-		{"unique", RELOPT_TYPE_BOOL, offsetof(lsm_options, unique)}};
-	// build_reloptions parses above and returns a struct with those parsed options
+		// {"unique", RELOPT_TYPE_BOOL, offsetof(lsm_options, unique)}
+	};
+	/* 
+		build_reloptions parses above and returns a struct with those parsed options
+		https://github.com/postgres/postgres/blob/master/src/backend/access/common/reloptions.c#L1910
+	*/
 	return (bytea *)build_reloptions(reloptions, validate, lsm_relopt_kind, sizeof(lsm_options), tab, lengthof(tab));
 }
 
@@ -233,31 +252,33 @@ static SortSupport lsm_build_sortkeys(Relation index)
 	SortSupport sortKeys = (SortSupport)palloc0(key_size * sizeof(SortSupportData));
 	/*
 		Builds an insert scan key.
-		A scan key is the internal representation of a WHERE clause of the form index_key operator constant,
+		A scan key is the internal representation of a WHERE clause of the form 'index_key operator constant',
 		where the index key is one of the columns of the index and the operator is one of the members of the
 		operator family associated with that index column.
 	*/
-	BTScanInsert insert_key = _bt_mkscankey(index, NULL);
+	BTScanInsert insert_key = _bt_mkscankey(index, NULL);	/* BTScanInsert: https://github.com/postgres/postgres/blob/master/src/include/access/nbtree.h */
 	Oid save_am = index->rd_rel->relam;
 	index->rd_rel->relam = BTREE_AM_OID;
 
 	for (int i = 0; i < key_size; i++)
 	{
-		SortSupport sortKey = &sortKeys[i];
-		ScanKey scanKey = &insert_key->scankeys[i];
+
+		SortSupport sortKey = &sortKeys[i];		/* SortSupport: https://github.com/postgres/postgres/blob/master/src/include/utils/sortsupport.h */
+		ScanKey scanKey = &insert_key->scankeys[i];		/* ScanKey: https://github.com/postgres/postgres/blob/master/src/include/access/skey.h */
 		int16 strategy;
 
+		// Need to fill these fields before calling PrepareSortSupportFromIndexRel()
 		sortKey->ssup_cxt = CurrentMemoryContext;
 		sortKey->ssup_collation = scanKey->sk_collation;
 		sortKey->ssup_nulls_first = (scanKey->sk_flag & SK_BT_NULLS_FIRST) != 0;
 		sortKey->ssup_attno = scanKey->sk_attno;
-		// no abbreviation support
+		// no abbreviation
 		sortKey->abbreviate = false;
 		Assert(sortKey->ssup_attno != 0);
 
 		strategy = (scanKey->sk_flags & SK_BT_DESC) != 0 ? BTGreaterStrategyNumber : BTLessStrategyNumber;
 
-		// this needs am to B-tree hence we set it above
+		// this needs am to be B-tree hence we set it above
 		PrepareSortSupportFromIndexRel(index, strategy, sortKey);
 	}
 	index->rd_rel->relam = save_am;
@@ -267,19 +288,26 @@ static SortSupport lsm_build_sortkeys(Relation index)
 // compare index tuples
 static int lsm_compare_index_tuples(IndexScanDesc scan1, IndexScanDesc scan2, SortSupport sortKeys)
 {
+	/* IndexScanDesc: https://github.com/postgres/postgres/blob/master/src/include/access/relscan.h */
+
+	
 	int n_keys = IndexRelationGetNumberOfKeyAttributes(scan1->indexRelation);
 
 	for (int i = 1; i <= n_keys; i++)
 	{
 		Datum datum[2];
-		bool isNumm[2];
+		bool isNull[2];
 		int result;
+
+		// IndexTuple	xs_itup;		/* index tuple returned by AM */
+		// struct TupleDescData *xs_itupdesc;	/* rowtype descriptor of xs_itup */
 
 		datum[0] = index_getattr(scan1->xs_itup, i, scan1->xs_itupdesc, &isNull[0]);
 		datum[1] = index_getattr(scan2->xs_itup, i, scan2->xs_itupdesc, &isNull[1]);
 		// sortKey is basically comparator
 		result = ApplySortComparator(datum[0], isNull[0], datum[1], isNull[1], &sortKeys[i - 1]);
 
+		// If not equal return 
 		if (result)
 			return result;
 	}
@@ -316,10 +344,18 @@ lsm_build(Relation heap, Relation index, IndexInfo *indexInfo)
 static void lsm_reacquire_locks(void)
 {
 	if (lsm_released_locks){
-		ListCell* cell;
+		ListCell* cell;		/* https://github.com/postgres/postgres/blob/master/src/include/nodes/pg_list.h */
 		foreach(cell, lsm_released_locks){
 			Oid index_oid = lfirst_oid(cell);
-			LockRelationOid(index_oid, RowExclusiveLock);
+		   /*
+			*		LockRelationOid
+			*
+			* Lock a relation given only its OID.  This should generally be used
+			* before attempting to open the relation's relcache entry.
+			* https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/lmgr.c#L103
+			*/
+
+			LockRelationOid(index_oid, RowExclusiveLock);	
 		}
 		list_free(lsm_released_locks);
 		lsm_released_locks = NULL;
@@ -361,7 +397,7 @@ static bool lsm_insert(
 		save_am = rel->rd_rel->relam;
 		rel->rd_rel->relam = BTREE_AM_OID;
 		response = btinsert(rel, values, isNull, ht_ctid, heapRel, checkUnique,
-#if PG_VERSION_NUM >= 14000
+#if PG_VERSION_NUM >= 140000
 						indexUnchanged,
 #endif
 						indexInfo);

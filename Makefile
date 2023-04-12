@@ -1,7 +1,7 @@
 # MODULE_big = lsm
 # OBJS = lsm.o
 
-EXTENSION = lsm        # the extensions name
+EXTENSION = lsm        # the extension's name
 DATA = lsm--1.0.sql  # script files to install
 MODULES = lsm
 

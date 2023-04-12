@@ -1,7 +1,7 @@
 #define LSM_CHK_TOP_IDX_SIZE_INTERVAL 1 << 15   // interval after which to check the size of top index
 
 /*
-    Control struct for LSM indexes for each relation
+    Control struct for LSM indices for each relation
 */
 typedef struct
 {
@@ -28,8 +28,7 @@ typedef struct
     Relation top_indices[2]; // Top 2 index relations
     SortSupport sortKeys;    // Context for comparing index tuples
     IndexScanDesc scan[3];   // Scan descriptors for the 3 indices
-    bool eoi[3];             // true if end of index was reached
-    bool unique;             
+    bool eoi[3];             // true if end of index was reached           
     int curr_index;          // index from which last tuple was selected
 } lsm_scan_desc;
 
@@ -37,5 +36,5 @@ typedef struct
 {
     BTOptions nbtree_opts; // Standard B-tree options
     int top_index_size;    // Max size of top index
-    bool unique;
+
 } lsm_options;
