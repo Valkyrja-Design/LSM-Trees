@@ -393,6 +393,15 @@ CREATE OPERATOR CLASS uuid_ops DEFAULT
     FUNCTION 4  btequalimage(oid);
 
 
+CREATE OR REPLACE FUNCTION lsm_nbtree_wrapper(internal)
+RETURNS index_am_handler
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+CREATE ACCESS METHOD lsm_nbtree_wrapper TYPE INDEX HANDLER lsm_nbtree_wrapper;
+
+CREATE OPERATOR FAMILY integer_ops USING lsm_nbtree_wrapper;
+
 CREATE OPERATOR CLASS char_ops DEFAULT
 	FOR TYPE "char" USING lsm_nbtree_wrapper AS
 	OPERATOR 1  <,
@@ -611,3 +620,15 @@ CREATE OPERATOR CLASS uuid_ops DEFAULT
 	FUNCTION 1  uuid_cmp(uuid,uuid),
 	FUNCTION 2  uuid_sortsupport(internal),
     FUNCTION 4  btequalimage(oid);
+
+CREATE FUNCTION lsm_get_merge_count(index regclass) returns bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
+
+CREATE FUNCTION lsm_start_merge(index regclass) returns void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
+
+CREATE FUNCTION lsm_wait_for_merge(index regclass) returns void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
+
+CREATE FUNCTION lsm_get_top_index_size(index regclass) returns bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
