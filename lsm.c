@@ -48,17 +48,20 @@ PG_FUNCTION_INFO_V1(lsm_nbtree_wrapper);
 extern void _PG_init(void);
 extern void _PG_fini(void);
 
-/* 
-	Hash table provided by Postgres 
+/*
+	Hash table provided by Postgres
 	https://github.com/postgres/postgres/blob/master/src/backend/utils/hash/dynahash.c
 */
-static HTAB *lsm_map;		 // maps relation Oid to control structure (lsm_entry)
+static HTAB *lsm_map; // maps relation Oid to control structure (lsm_entry)
 /*
 	Lightweight Lock, provides shared and exclusive access modes
 	https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/lwlock.c
 */
 static LWLock *lsm_map_lock; // lock for access to lsm_map
 // static List *lsm_released_locks;
+/*
+	https://github.com/postgres/postgres/blob/master/src/include/nodes/pg_list.h
+*/
 static List *lsm_entries;
 // static bool lsm_inside_copy;
 
@@ -83,6 +86,7 @@ static ExecutorFinish_hook_type prev_executor_finish_hook = NULL;
 static volatile bool lsm_terminate;
 
 // Our custom shared memory request function (hook) to reserve space for control data of all the indices
+/* https://pgpedia.info/s/shmem_request_hook.html */
 static void lsm_shmem_request(void)
 {
 
@@ -136,12 +140,12 @@ static void lsm_init_entry(lsm_entry *entry, Relation index)
 	// entry->n_merges = 0;
 	// entry->n_inserts = 0;
 	entry->top_indices[0] = entry->top_indices[1] = InvalidOid;
-	/* 
-		rd_index is a tuple describing this index and we use it to fetch Oid of the relation it indexes 
+	/*
+		rd_index is a tuple describing this index and we use it to fetch Oid of the relation it indexes
 		Relation : https://github.com/postgres/postgres/blob/master/src/include/utils/rel.h
 		Form_pg_index : https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_index.h
 	*/
-	entry->heap = index->rd_index->indrelid;	
+	entry->heap = index->rd_index->indrelid;
 	entry->db_id = MyDatabaseId;
 	entry->user_id = GetUserId();
 	entry->top_index_size = index->rd_options ? ((lsm_options *)index->rd_options)->top_index_size : 0;
@@ -221,12 +225,7 @@ static void lsm_truncate_index(Oid index_oid, Oid heap_oid)
 	table_close(heap, AccessShareLock);
 }
 
-// Dunno about this
-#if PG_VERSION_NUM >= 140000
 #define INSERT_FLAGS UNIQUE_CHECK_NO, false
-#else
-#define INSERT_FLAGS false
-#endif
 
 // constructing lsm_options from reloptions
 static bytea *lsm_get_options(Datum reloptions, bool validate)
@@ -238,7 +237,7 @@ static bytea *lsm_get_options(Datum reloptions, bool validate)
 		{"top_index_size", RELOPT_TYPE_INT, offsetof(lsm_options, top_index_size)},
 		// {"unique", RELOPT_TYPE_BOOL, offsetof(lsm_options, unique)}
 	};
-	/* 
+	/*
 		build_reloptions parses above and returns a struct with those parsed options
 		https://github.com/postgres/postgres/blob/master/src/backend/access/common/reloptions.c#L1910
 	*/
@@ -256,15 +255,15 @@ static SortSupport lsm_build_sortkeys(Relation index)
 		where the index key is one of the columns of the index and the operator is one of the members of the
 		operator family associated with that index column.
 	*/
-	BTScanInsert insert_key = _bt_mkscankey(index, NULL);	/* BTScanInsert: https://github.com/postgres/postgres/blob/master/src/include/access/nbtree.h */
+	BTScanInsert insert_key = _bt_mkscankey(index, NULL); /* BTScanInsert: https://github.com/postgres/postgres/blob/master/src/include/access/nbtree.h */
 	Oid save_am = index->rd_rel->relam;
 	index->rd_rel->relam = BTREE_AM_OID;
 
 	for (int i = 0; i < key_size; i++)
 	{
 
-		SortSupport sortKey = &sortKeys[i];		/* SortSupport: https://github.com/postgres/postgres/blob/master/src/include/utils/sortsupport.h */
-		ScanKey scanKey = &insert_key->scankeys[i];		/* ScanKey: https://github.com/postgres/postgres/blob/master/src/include/access/skey.h */
+		SortSupport sortKey = &sortKeys[i];			/* SortSupport: https://github.com/postgres/postgres/blob/master/src/include/utils/sortsupport.h */
+		ScanKey scanKey = &insert_key->scankeys[i]; /* ScanKey: https://github.com/postgres/postgres/blob/master/src/include/access/skey.h */
 		int16 strategy;
 
 		// Need to fill these fields before calling PrepareSortSupportFromIndexRel()
@@ -290,7 +289,6 @@ static int lsm_compare_index_tuples(IndexScanDesc scan1, IndexScanDesc scan2, So
 {
 	/* IndexScanDesc: https://github.com/postgres/postgres/blob/master/src/include/access/relscan.h */
 
-	
 	int n_keys = IndexRelationGetNumberOfKeyAttributes(scan1->indexRelation);
 
 	for (int i = 1; i <= n_keys; i++)
@@ -307,7 +305,7 @@ static int lsm_compare_index_tuples(IndexScanDesc scan1, IndexScanDesc scan2, So
 		// sortKey is basically comparator
 		result = ApplySortComparator(datum[0], isNull[0], datum[1], isNull[1], &sortKeys[i - 1]);
 
-		// If not equal return 
+		// If not equal return
 		if (result)
 			return result;
 	}
@@ -343,19 +341,21 @@ lsm_build(Relation heap, Relation index, IndexInfo *indexInfo)
 // Grab released locks for merger to proceed
 static void lsm_reacquire_locks(void)
 {
-	if (lsm_released_locks){
-		ListCell* cell;		/* https://github.com/postgres/postgres/blob/master/src/include/nodes/pg_list.h */
-		foreach(cell, lsm_released_locks){
+	if (lsm_released_locks)
+	{
+		ListCell *cell;
+		foreach (cell, lsm_released_locks)
+		{
 			Oid index_oid = lfirst_oid(cell);
-		   /*
-			*		LockRelationOid
-			*
-			* Lock a relation given only its OID.  This should generally be used
-			* before attempting to open the relation's relcache entry.
-			* https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/lmgr.c#L103
-			*/
+			/*
+			 *		LockRelationOid
+			 *
+			 * Lock a relation given only its OID.  This should generally be used
+			 * before attempting to open the relation's relcache entry.
+			 * https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/lmgr.c#L103
+			 */
 
-			LockRelationOid(index_oid, RowExclusiveLock);	
+			LockRelationOid(index_oid, RowExclusiveLock);
 		}
 		list_free(lsm_released_locks);
 		lsm_released_locks = NULL;
@@ -368,12 +368,10 @@ static void lsm_reacquire_locks(void)
 static bool lsm_insert(
 	Relation rel, Datum *values, bool *isNull, ItemPointer ht_ctid,
 	Relation heapRel, IndexUniqueCheck checkUnique,
-#if PG_VERSION_NUM >= 140000
 	bool indexUnchanged,
-#endif
 	IndexInfo *indexInfo)
 {
-	lsm_entry* entry = lsm_get_entry(index);
+	lsm_entry *entry = lsm_get_entry(index);
 	int active_index;
 	uint64 n_merges;
 	Relation index;
@@ -392,15 +390,14 @@ static bool lsm_insert(
 	n_merges = entry->n_merges;
 	SpinLockRelease(&entry->spinlock);
 
-	if (!is_initialized){
+	if (!is_initialized)
+	{
 		bool response;
 		save_am = rel->rd_rel->relam;
 		rel->rd_rel->relam = BTREE_AM_OID;
 		response = btinsert(rel, values, isNull, ht_ctid, heapRel, checkUnique,
-#if PG_VERSION_NUM >= 140000
-						indexUnchanged,
-#endif
-						indexInfo);
+							indexUnchanged,
+							indexInfo);
 		index->rd_rel->relam = save_am;
 		return response;
 	}
@@ -410,7 +407,7 @@ static bool lsm_insert(
 	index->rd_rel->relam = BTREE_AM_OID;
 	save_am = index->rd_rel->relam;
 	btinsert(index, values, isNull, ht_ctid, heapRel, checkUnique,
-#if PG_VERSION_NUM>=140000
+#if PG_VERSION_NUM >= 140000
 			 indexUnchanged,
 #endif
 			 indexInfo);
@@ -418,44 +415,49 @@ static bool lsm_insert(
 	index_close(index, RowExclusiveLock);
 	index->rd_rel->relam = save_am;
 
-	overflow = !entry->merge_in_progress /* don't check for overflow if merge already initiated */	
-			&& (entry->n_inserts % LSM_CHK_TOP_IDX_SIZE_INTERVAL == 0)	/* periodic check */
-			&& (RelationGetNumberOfBlocks(index) * (BLCKSZ/1024) > top_index_size);
+	overflow = !entry->merge_in_progress								  /* don't check for overflow if merge already initiated */
+			   && (entry->n_inserts % LSM_CHK_TOP_IDX_SIZE_INTERVAL == 0) /* periodic check */
+			   && (RelationGetNumberOfBlocks(index) * (BLCKSZ / 1024) > top_index_size);
 
 	SpinLockAcquire(&entry->spinlock);
 	// start merge if not already in progress
-	if (overflow && !entry->merge_in_progress && entry->n_merges == n_merges){
+	if (overflow && !entry->merge_in_progress && entry->n_merges == n_merges)
+	{
 		Assert(entry->active_index = active_index);
 		entry->merge_in_progress = true;
-		entry->active_index ^= 1;	/* swap active indices */
+		entry->active_index ^= 1; /* swap active indices */
 		entry->n_merges++;
 	}
 
 	Assert(entry->access_count[active_index] > 0);
 	entry->access_count[active_index] -= 1;
 	entry->n_inserts++;
-	if (entry->merge_in_progress){
+	if (entry->merge_in_progress)
+	{
 		LOCKTAG tag;
-		SET_LOCKTAG_RELATION(tag, MyDatabaseId, entry->top[1-active_index]);
+		SET_LOCKTAG_RELATION(tag, MyDatabaseId, entry->top[1 - active_index]);
 		// Holding lock on non-active relation prevents bgworker from truncating this index
-		if (LockHeldByMe(&tag, RowExclusiveLock)){
+		if (LockHeldByMe(&tag, RowExclusiveLock))
+		{
 			/* Copy locks all indexes and hold this locks until end of copy.
 			 * We can not just release lock, because otherwise CopyFrom produces
 			 * "you don't own a lock of type" warning.
 			 * So just try to periodically release this lock and let merger grab it.
 			 */
 			/* release lock periodically */
-			if (!lsm_inside_copy || (entry->n_inserts % LSM_CHK_TOP_IDX_SIZE_INTERVAL  == 0)){
+			if (!lsm_inside_copy || (entry->n_inserts % LSM_CHK_TOP_IDX_SIZE_INTERVAL == 0))
+			{
 				LockRelease(&tag, RowExclusiveLock, false);
-				lsm_released_locks = lappend_oid(lsm_released_locks, entry->top[1-active_index]);
+				lsm_released_locks = lappend_oid(lsm_released_locks, entry->top[1 - active_index]);
 			}
 		}
 
 		/* if all inserts in previous active index are done we can start merge */
-		if (entry->active_index != active_index && entry->access_count[active_index] == 0){
+		if (entry->active_index != active_index && entry->access_count[active_index] == 0)
+		{
 			entry->start_merge = true;
-			if (entry->compactor == NULL){
-
+			if (entry->compactor == NULL)
+			{
 			}
 			// SetLatch(&entry->compactor->procLatch);
 		}
@@ -463,7 +465,8 @@ static bool lsm_insert(
 	SpinLockRelease(&entry->spinlock);
 
 	/* We have to require released locks because othervise CopyFrom will produce warning */
-	if (lsm_inside_copy && lsm_released_locks){
+	if (lsm_inside_copy && lsm_released_locks)
+	{
 		pg_usleep(1);
 		lsm_reacquire_locks();
 	}
@@ -471,9 +474,10 @@ static bool lsm_insert(
 	return false;
 }
 
-static IndexScanDesc lsm_beginscan(Relation rel, int nkeys, int norderbys){
+static IndexScanDesc lsm_beginscan(Relation rel, int nkeys, int norderbys)
+{
 	IndexScanDesc scan;
-	lsm_scan_desc* lsd;
+	lsm_scan_desc *lsd;
 	int i;
 
 	/* no order by operators */
@@ -481,42 +485,49 @@ static IndexScanDesc lsm_beginscan(Relation rel, int nkeys, int norderbys){
 
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 	scan->xs_itupdesc = RelationGetDescr(rel);
-	lsd = (lsm_scan_desc*)palloc(sizeof(lsm_scan_desc));
+	lsd = (lsm_scan_desc *)palloc(sizeof(lsm_scan_desc));
 	lsd->entry = lsm_get_entry(rel);
 	lsd->sortKeys = lsm_build_sortkeys(rel);
 
-	for (int i=0;i<2;i++){
-		if (lsd->entry->top[i]){
+	for (int i = 0; i < 2; i++)
+	{
+		if (lsd->entry->top[i])
+		{
 			lsd->top_indices[i] = index_open(lsd->entry->top_indices[i], AccessShareLock);
 			lsd->scan[i] = btbeginscan(lsd->top_indices[i], nkeys, norderbys);
-		} else {
+		}
+		else
+		{
 			lsd->top_indices[i] = NULL;
 			lsd->scan[i] = NULL;
 		}
 	}
 
 	lsd->scan[2] = btbeginscan(rel, nkeys, norderbys);
-	for (int i=0;i<3;i++){
-		if (lsd->scan[i]){
+	for (int i = 0; i < 3; i++)
+	{
+		if (lsd->scan[i])
+		{
 			lsd->eoi[i] = false;
 			lsd->scan[i]->xs_want_itup = true;
 			lsd->scan[i]->parallel_scan = NULL;
 		}
 	}
-	lsd->unique = rel->rd_options ? ((lsm_options*)rel->rd_options)->unique : false;
+	lsd->unique = rel->rd_options ? ((lsm_options *)rel->rd_options)->unique : false;
 	lsd->curr_index = -1;
 	scan->opaque = lsd;
 
 	return scan;
 }
 
-static void lsm_rescan(IndexScanDesc scan, ScanKey scanKey, int nscankeys
-					, ScanKey orderbys, int norderbys)
+static void lsm_rescan(IndexScanDesc scan, ScanKey scanKey, int nscankeys, ScanKey orderbys, int norderbys)
 {
-	lsm_scan_desc* lsd = (lsm_scan_desc*) scan->opaque;
+	lsm_scan_desc *lsd = (lsm_scan_desc *)scan->opaque;
 	lsd->curr_index = -1;
-	for (int i=0;i<3;i++){
-		if (lsd->scan[i]){
+	for (int i = 0; i < 3; i++)
+	{
+		if (lsd->scan[i])
+		{
 			btreescan(lsd->scan[i], scankey, nscankeys, orderbys, norderbys);
 			lsd->eoi[i] = false;
 		}
@@ -525,10 +536,12 @@ static void lsm_rescan(IndexScanDesc scan, ScanKey scanKey, int nscankeys
 
 static void lsm_endscan(IndexScanDesc scan)
 {
-	lsm_scan_desc* lsd = (lsm_scan_desc*)scan->opaque;
+	lsm_scan_desc *lsd = (lsm_scan_desc *)scan->opaque;
 
-	for (int i=0;i<3;i++){
-		if (lsd->scan[i]){
+	for (int i = 0; i < 3; i++)
+	{
+		if (lsd->scan[i])
+		{
 			btendscan(lsd->scan[i]);
 			if (i < 2)
 				index_close(lsd->top_indices[i], AccessShareLock);
@@ -539,23 +552,25 @@ static void lsm_endscan(IndexScanDesc scan)
 
 static bool lsm_gettuple(IndexScanDesc scan, ScanDirection dir)
 {
-	lsm_scan_desc* lsd = (lsm_scan_desc*)scan->opaque;
+	lsm_scan_desc *lsd = (lsm_scan_desc *)scan->opaque;
 	int min = -1;
 	int curr = lsd->curr_index;
 	/* start with active index then merging then base */
-	int try_index_order[3] = {lsd->entry->active_index, 1-lsd->entry->active_index, 2};
+	int try_index_order[3] = {lsd->entry->active_index, 1 - lsd->entry->active_index, 2};
 
 	/* btree indices are not lossy */
 	scan->xs_recheck = false;
 
-	if (curr >= 0) 
+	if (curr >= 0)
 		lsd->eoi[curr] = !_bt_next(lsd->scan[curr], dir); /* move forward current index */
 
-	for (int j=0;j<3;j++){
+	for (int j = 0; j < 3; j++)
+	{
 		int i = try_index_order[j];
 		BTScanOpaque bto = (BTScanOpaque)lsd->scan[i]->opaque;
 		lsd->scan[i]->xs_snapshot = scan->xs_snapshot;
-		if (!lsd->eoi[i] && !BTScanPosIsValid(bto->currPos)){
+		if (!lsd->eoi[i] && !BTScanPosIsValid(bto->currPos))
+		{
 			lsd->eoi[i] = !_bt_first(lsd->scan[i], dir);
 			if (!lsd->eoi[i] && lsd->unique && scan->numberOfKeys == scan->indexRelation->rd_index->indnkeyatts)
 			{
@@ -563,7 +578,7 @@ static bool lsm_gettuple(IndexScanDesc scan, ScanDirection dir)
 				 * then we can stop after locating first occurrence.
 				 * If make it possible to avoid lookups of all three indexes.
 				 */
-				elog(DEBUG1, "Lsm3: lookup %d indices", j+1);
+				elog(DEBUG1, "Lsm3: lookup %d indices", j + 1);
 				while (++j < 3) /* prevent search of all remanining indexes */
 				{
 					lsd->eoi[try_index_order[j]] = true;
@@ -574,9 +589,12 @@ static bool lsm_gettuple(IndexScanDesc scan, ScanDirection dir)
 		}
 		if (!lsd->eoi[i])
 		{
-			if (min < 0){
+			if (min < 0)
+			{
 				min = i;
-			} else {
+			}
+			else
+			{
 				int result = lsm_compare_index_tuples(lsm->scan[i], lsm->scan[min], lsm->sortKeys);
 				if (result == 0)
 				{
@@ -590,19 +608,19 @@ static bool lsm_gettuple(IndexScanDesc scan, ScanDirection dir)
 			}
 		}
 	}
-	if (min < 0)	/* all indices traversed but didn't find match */
+	if (min < 0) /* all indices traversed but didn't find match */
 		return false;
-	
-	scan->xs_heaptid = lsd->scan[min]->xs_heaptid;	/* copy TID */
+
+	scan->xs_heaptid = lsd->scan[min]->xs_heaptid; /* copy TID */
 	if (scan->xs_want_itup)
 		scan->xs_itup = lsd->scan[min]->xs_itup;
-	lsd->curr_index = min;	
+	lsd->curr_index = min;
 	return true;
 }
 
 static int64 lsm_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
-	lsm_scan_desc* lsd = (lsm_scan_desc*)scan->opaque;
+	lsm_scan_desc *lsd = (lsm_scan_desc *)scan->opaque;
 	int64 ntids = 0;
 	for (int i = 0; i < 3; i++)
 	{
@@ -673,17 +691,14 @@ Datum lsm_handler(PG_FUNCTION_ARGS)
 static IndexBuildResult *
 lsm_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 {
-	Page		metapage;
+	/* https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/nbtree.c#L152 */
+	Page metapage;
 
 	/* Construct metapage. */
-	metapage = (Page) palloc(BLCKSZ);
+	metapage = (Page)palloc(BLCKSZ);
 	_bt_initmetapage(metapage, BTREE_METAPAGE, 0, _bt_allequalimage(index, false));
 
-#if PG_VERSION_NUM>=150000
 	RelationGetSmgr(index);
-#else
-	RelationOpenSmgr(index);
-#endif
 
 	/*
 	 * Write the page and log it.  It might seem that an immediate sync would
@@ -694,14 +709,9 @@ lsm_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 	 */
 	PageSetChecksumInplace(metapage, BTREE_METAPAGE);
 	smgrextend(index->rd_smgr, MAIN_FORKNUM, BTREE_METAPAGE,
-			   (char *) metapage, true);
-#if PG_VERSION_NUM>=160000
-	log_newpage(&index->rd_smgr->smgr_rlocator.locator, MAIN_FORKNUM,
-				BTREE_METAPAGE, metapage, true);
-#else
+			   (char *)metapage, true);
 	log_newpage(&index->rd_smgr->smgr_rnode.node, MAIN_FORKNUM,
 				BTREE_METAPAGE, metapage, true);
-#endif
 	/*
 	 * An immediate sync is required even if we xlog'd the page, because the
 	 * write did not go through shared_buffers and therefore a concurrent
@@ -710,23 +720,20 @@ lsm_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 	smgrimmedsync(index->rd_smgr, MAIN_FORKNUM);
 	RelationCloseSmgr(index);
 
-	return (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
+	return (IndexBuildResult *)palloc0(sizeof(IndexBuildResult));
 }
 
 static bool
 lsm_dummy_insert(Relation rel, Datum *values, bool *isnull,
-				  ItemPointer ht_ctid, Relation heapRel,
-				  IndexUniqueCheck checkUnique,
-#if PG_VERSION_NUM>=140000
-				  bool indexUnchanged,
-#endif
-				  IndexInfo *indexInfo)
+				 ItemPointer ht_ctid, Relation heapRel,
+				 IndexUniqueCheck checkUnique,
+				 bool indexUnchanged,
+				 IndexInfo *indexInfo)
 {
 	return false;
 }
 
-Datum
-lsm_nbtree_wrapper(PG_FUNCTION_ARGS)
+Datum lsm_nbtree_wrapper(PG_FUNCTION_ARGS)
 {
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
@@ -775,23 +782,141 @@ lsm_nbtree_wrapper(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(amroutine);
 }
 
-/* Utility hook handling creation of lsm indices */
-static void lsm_process_utitlity(PlannedStmt *plannedStmt,
+/*
+	Utility hook handling creation and deletion of lsm indices
+	Process utility hook ref :
+	https://github.com/postgres/postgres/blob/master/contrib/pg_stat_statements/pg_stat_statements.c#L1080
+*/
+static void lsm_process_utility(PlannedStmt *plannedStmt,
 								const char *queryString,
-#if PG_VERSION_NUM>=150000
-					 bool readOnlyTree,
-#endif
-					 ProcessUtilityContext context,
-					 ParamListInfo paramListInfo,
-					 QueryEnvironment *queryEnvironment,
-					 DestReceiver *destReceiver,
-#if PG_VERSION_NUM>=130000
-					 QueryCompletion *completionTag
-#else
-	                 char *completionTag
-#endif
-){
+								bool readOnlyTree,
+								ProcessUtilityContext context,
+								ParamListInfo params,
+								QueryEnvironment *queryEnv,
+								DestReceiver *dest,
+								QueryCompletion *qc)
+{
+	Node *parseTree = plannedStmt->utilityStmt;
+	/*
+		https://github.com/postgres/postgres/blob/master/src/include/nodes/parsenodes.h
+	*/
+	DropStmt *drop = NULL; // DROP <Object_type>
+	/* https://github.com/postgres/postgres/blob/master/src/include/catalog/objectaddress.h#L22 */
+	ObjectAddresses *objects_dropped = NULL;
+	List *dropped_oids = NULL;
+	ListCell *cell;
 
+	lsm_entries = NULL;
+	// lsm_inside_copy = false;
+
+	if (IsA(parseTree, DropStmt))
+	{
+		drop = (DropStmt *)parseTree;
+		if (drop->removeType == OBJECT_INDEX)
+		{ // Removing index
+			foreach (cell, drop->objects)
+			{
+				/* https://github.com/postgres/postgres/blob/master/src/include/nodes/primnodes.h#L55 */
+				RangeVar *range_var = makeRangeVarFromNameList((List *)lfirst(cell));
+				Relation index = relation_openrv(rv, ExclusiveLock);
+				if (index->rd_indam->ambuild == = lms_build)
+				{ // lsm type index
+					lsm_entry *entry = lsm_get_entry(index);
+					if (objects_dropped == NULL)
+					{
+						objects_dropped = new_object_addresses();
+					}
+					// add the top two indices to dropped objects
+					for (int i = 0; i < 2; i++)
+					{
+						if (entry->top[i])
+						{
+							ObjectAddress obj_addr;
+							obj_addr.classId = RelationRelationId;
+							obj_addr.objectId = entry->top[i];
+							obj_addr.objectSubId = 0;
+							add_exact_object_address(&obj_addr, objects_dropped);
+						}
+					}
+					dropped_oids = lappend_oid(dropped_oids, RelationGetRelid(index));
+				}
+				relation_close(index, ExclusiveLock);
+			}
+		}
+	}
+
+	// Call previous process utility hooks
+	(prev_process_utility_hook ? prev_process_utility_hook : standard_ProcessUtility)(
+		plannedStmt,
+		queryString,
+		readOnlyTree,
+		context,
+		params,
+		queryEnv,
+		dest,
+		qc);
+
+	// new lsm indices might have been created (handled by standard utility hook)
+	// so we now create the corresponding top indices
+	if (lsm_entries)
+	{
+		foreach (cell, lsm_entries)
+		{
+			lsm_entry *entry = (lsm_entry *)lfirst(cell);
+			Oid top_indices[2];
+			if (IsA(parseTree, IndexStmt))
+			{ 
+				IndexStmt *stmt = (IndexStmt *)parseTree;
+				char *idx_name = stmt->idxname;
+				char *am = stmt->accessMethod;
+
+				// create top 2 indices 
+				for (int i = 0; i < 2; i++)
+				{
+					stmt->accessMethod = "lsm_btree_wrapper";
+					stmt->idxname = psprintf("%s_top%d", get_rel_name(entry->base), i);
+					/* https://github.com/postgres/postgres/blob/master/src/backend/commands/indexcmds.c#L488 */
+					top_indices[i] = DefineIndex(entry->heap, stmt, InvalidOid, InvalidOid, InvalidOid, false, false, false, false, true).objectId;
+				}
+				stmt->accessMethod = am;
+				stmt->idxname = idx_name;
+			} 
+			// else { where might this be needed?
+			// 	for (int i=0;i<2;i++){
+			// 		top_indices[i] = entry->top[i];
+			// 		if (top_index[i] == InvalidOid)
+			// 	}
+			// }
+			CommitTransactionCommand();
+			StartTransactionCommand();
+			/* prevent planner from using these indices */
+			for (int i=0;i<2;i++){
+				index_set_state_flags(top_indices[i], INDEX_DROP_CLEAR_VALID);
+			}
+			// set top index oids in entry
+			SpinLockAcquire(&entry->spinlock);
+			for (int i=0;i<2;i++){
+				entry->top_indices[i] = top_indices[i];
+			}
+			SpinLockRelease(&entry->spinlock);
+			{
+				// set am to lsm (was set to btree on creation)
+				Relation index = index_open(entry->base, AccessShareLock);
+				index->rd_rel->relam = entry->am_id;
+				index_close(index, AccessShareLock);
+			}
+		}
+		list_free(lsm_entries);
+		lsm_entries = NULL;
+	} else if (objects_dropped){
+		// Remove dropped indices from lsm_map and correspoding auxiliary indices
+		performMultipleDeletions(objects_dropped, drop->behavior, 0);
+		LWLockAcquire(lsm_map_lock, LW_EXCLUSIVE);
+		foreach(cell, dropped_oids){
+			hash_search(lsm_map, &lfirst_oid(cell), HASH_REMOVE, NULL);
+		}
+		LWLockRelease(lsm_map_lock);
+	}
 }
 
 void _PG_init(void)
