@@ -1,4 +1,4 @@
--- lsm operators
+-- Lsm operators
 
 CREATE OR REPLACE FUNCTION lsm_handler(internal)
 RETURNS index_am_handler
@@ -160,7 +160,7 @@ CREATE OPERATOR CLASS bpchar_ops DEFAULT
 	OPERATOR 5  >,
 	FUNCTION 1  bpcharcmp(bpchar,bpchar),
 	FUNCTION 2  bpchar_sortsupport(internal),
-    FUNCTION 4  btvarstrequalimage(oid);
+    FUNCTION 4  btvarstrequalimage(oid); --# used to generate a hash value for a variable-length string
 
 CREATE OPERATOR CLASS bytea_ops DEFAULT
 	FOR TYPE bytea USING lsm AS
@@ -401,6 +401,170 @@ LANGUAGE C;
 CREATE ACCESS METHOD lsm_nbtree_wrapper TYPE INDEX HANDLER lsm_nbtree_wrapper;
 
 CREATE OPERATOR FAMILY integer_ops USING lsm_nbtree_wrapper;
+
+CREATE OPERATOR CLASS int2_ops DEFAULT
+	FOR TYPE int2 USING lsm_nbtree_wrapper FAMILY integer_ops AS
+	OPERATOR 1  <,
+	OPERATOR 2  <=,
+	OPERATOR 3  =,
+	OPERATOR 4  >=,
+	OPERATOR 5  >,
+	FUNCTION 1  btint2cmp(int2,int2);
+
+CREATE OPERATOR CLASS int4_ops DEFAULT
+	FOR TYPE int4 USING lsm_nbtree_wrapper FAMILY integer_ops AS
+	OPERATOR 1  <,
+	OPERATOR 2  <=,
+	OPERATOR 3  =,
+	OPERATOR 4  >=,
+	OPERATOR 5  >,
+	FUNCTION 1  btint4cmp(int4,int4);
+
+CREATE OPERATOR CLASS int8_ops DEFAULT
+	FOR TYPE int8 USING lsm_nbtree_wrapper FAMILY integer_ops AS
+	OPERATOR 1  <,
+	OPERATOR 2  <=,
+	OPERATOR 3  =,
+	OPERATOR 4  >=,
+	OPERATOR 5  >,
+	FUNCTION 1  btint8cmp(int8,int8);
+
+ALTER OPERATOR FAMILY integer_ops USING lsm_nbtree_wrapper ADD
+	OPERATOR 1  < (int2,int4),
+	OPERATOR 1  < (int2,int8),
+	OPERATOR 1  < (int4,int2),
+	OPERATOR 1  < (int4,int8),
+	OPERATOR 1  < (int8,int2),
+	OPERATOR 1  < (int8,int4),
+
+	OPERATOR 2  <= (int2,int4),
+	OPERATOR 2  <= (int2,int8),
+	OPERATOR 2  <= (int4,int2),
+	OPERATOR 2  <= (int4,int8),
+	OPERATOR 2  <= (int8,int2),
+	OPERATOR 2  <= (int8,int4),
+
+	OPERATOR 3  = (int2,int4),
+	OPERATOR 3  = (int2,int8),
+	OPERATOR 3  = (int4,int2),
+	OPERATOR 3  = (int4,int8),
+	OPERATOR 3  = (int8,int2),
+	OPERATOR 3  = (int8,int4),
+
+	OPERATOR 4  >= (int2,int4),
+	OPERATOR 4  >= (int2,int8),
+	OPERATOR 4  >= (int4,int2),
+	OPERATOR 4  >= (int4,int8),
+	OPERATOR 4  >= (int8,int2),
+	OPERATOR 4  >= (int8,int4),
+
+	OPERATOR 5  > (int2,int4),
+	OPERATOR 5  > (int2,int8),
+	OPERATOR 5  > (int4,int2),
+	OPERATOR 5  > (int4,int8),
+	OPERATOR 5  > (int8,int2),
+	OPERATOR 5  > (int8,int4),
+
+	FUNCTION 1(int2,int4)  btint24cmp(int2,int4),
+	FUNCTION 1(int2,int8)  btint28cmp(int2,int8),
+	FUNCTION 1(int4,int2)  btint42cmp(int4,int2),
+	FUNCTION 1(int4,int8)  btint48cmp(int4,int8),
+	FUNCTION 1(int8,int4)  btint84cmp(int8,int4),
+	FUNCTION 1(int8,int2)  btint82cmp(int8,int2),
+
+	FUNCTION 2(int2,int2)  btint2sortsupport(internal),
+	FUNCTION 2(int4,int4)  btint4sortsupport(internal),
+	FUNCTION 2(int8,int8)  btint8sortsupport(internal),
+
+    FUNCTION 3(int2,int8)  in_range(int2,int2,int8,bool,bool),
+    FUNCTION 3(int2,int4)  in_range(int2,int2,int4,bool,bool),
+    FUNCTION 3(int2,int2)  in_range(int2,int2,int2,bool,bool),
+    FUNCTION 3(int4,int8)  in_range(int4,int4,int8,bool,bool),
+    FUNCTION 3(int4,int4)  in_range(int4,int4,int4,bool,bool),
+    FUNCTION 3(int4,int2)  in_range(int4,int4,int2,bool,bool),
+    FUNCTION 3(int8,int8)  in_range(int8,int8,int8,bool,bool),
+
+    FUNCTION 4(int2,int2)  btequalimage(oid),
+    FUNCTION 4(int4,int4)  btequalimage(oid),
+    FUNCTION 4(int8,int8)  btequalimage(oid);
+
+CREATE OPERATOR FAMILY float_ops USING lsm_nbtree_wrapper;
+
+CREATE OPERATOR CLASS float4_ops DEFAULT
+	FOR TYPE float4 USING lsm_nbtree_wrapper FAMILY float_ops AS
+	OPERATOR 1  <,
+	OPERATOR 2  <=,
+	OPERATOR 3  =,
+	OPERATOR 4  >=,
+	OPERATOR 5  >,
+	FUNCTION 1  btfloat4cmp(float4,float4);
+
+CREATE OPERATOR CLASS float8_ops DEFAULT
+	FOR TYPE float8 USING lsm_nbtree_wrapper FAMILY float_ops AS
+	OPERATOR 1  <,
+	OPERATOR 2  <=,
+	OPERATOR 3  =,
+	OPERATOR 4  >=,
+	OPERATOR 5  >,
+	FUNCTION 1  btfloat8cmp(float8,float8);
+
+
+ALTER OPERATOR FAMILY float_ops USING lsm_nbtree_wrapper ADD
+	OPERATOR 1  < (float4,float8),
+	OPERATOR 1  < (float8,float4),
+
+	OPERATOR 2  <= (float4,float8),
+	OPERATOR 2  <= (float8,float4),
+
+	OPERATOR 3  = (float4,float8),
+	OPERATOR 3  = (float8,float4),
+
+	OPERATOR 4  >= (float4,float8),
+	OPERATOR 4  >= (float8,float4),
+
+	OPERATOR 5  > (float4,float8),
+	OPERATOR 5  > (float8,float4),
+
+	FUNCTION 1(float4,float8)  btfloat48cmp(float4,float8),
+	FUNCTION 1(float8,float4)  btfloat84cmp(float8,float4),
+
+	FUNCTION 2(float4,float4)  btfloat4sortsupport(internal),
+	FUNCTION 2(float8,float8)  btfloat8sortsupport(internal),
+
+    FUNCTION 3(float4,float8)  in_range(float4,float4,float8,bool,bool),
+    FUNCTION 3(float8,float8)  in_range(float8,float8,float8,bool,bool);
+
+CREATE OPERATOR CLASS bool_ops DEFAULT
+	FOR TYPE bool USING lsm_nbtree_wrapper AS
+	OPERATOR 1  <,
+	OPERATOR 2  <=,
+	OPERATOR 3  =,
+	OPERATOR 4  >=,
+	OPERATOR 5  >,
+	FUNCTION 1  btboolcmp(bool,bool),
+    FUNCTION 4  btequalimage(oid);
+
+CREATE OPERATOR CLASS bpchar_ops DEFAULT
+	FOR TYPE bpchar USING lsm_nbtree_wrapper AS
+	OPERATOR 1  <,
+	OPERATOR 2  <=,
+	OPERATOR 3  =,
+	OPERATOR 4  >=,
+	OPERATOR 5  >,
+	FUNCTION 1  bpcharcmp(bpchar,bpchar),
+	FUNCTION 2  bpchar_sortsupport(internal),
+    FUNCTION 4  btvarstrequalimage(oid);
+
+CREATE OPERATOR CLASS bytea_ops DEFAULT
+	FOR TYPE bytea USING lsm_nbtree_wrapper AS
+	OPERATOR 1  <,
+	OPERATOR 2  <=,
+	OPERATOR 3  =,
+	OPERATOR 4  >=,
+	OPERATOR 5  >,
+	FUNCTION 1  byteacmp(bytea,bytea),
+	FUNCTION 2  bytea_sortsupport(internal),
+    FUNCTION 4  btequalimage(oid);
 
 CREATE OPERATOR CLASS char_ops DEFAULT
 	FOR TYPE "char" USING lsm_nbtree_wrapper AS

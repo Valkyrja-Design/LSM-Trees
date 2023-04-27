@@ -30,11 +30,16 @@ typedef struct
     IndexScanDesc scan[3];   // Scan descriptors for the 3 indices
     bool eoi[3];             // true if end of index was reached           
     int curr_index;          // index from which last tuple was selected
+	bool           unique;     /* Whether index is "unique" and we can stop scan after locating first occurrence */
 } lsm_scan_desc;
 
 typedef struct
 {
     BTOptions nbtree_opts; // Standard B-tree options
     int top_index_size;    // Max size of top index
+    bool        unique;			/* Index may not contain duplicates. We prohibit unique constraint for Lsm index
+                                 * because it can not be enforced. But presence of this index option allows to optimize
+								 * index lookup: if key is found in active top index, do not search other two indexes.
+                                 */
 
 } lsm_options;

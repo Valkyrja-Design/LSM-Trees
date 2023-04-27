@@ -42,6 +42,9 @@
 PG_MODULE_MAGIC;
 #endif
 
+/* 
+	declare functions as PostgreSQL user-defined function
+*/
 PG_FUNCTION_INFO_V1(lsm_handler);
 PG_FUNCTION_INFO_V1(lsm_nbtree_wrapper);
 PG_FUNCTION_INFO_V1(lsm_get_merge_count);
@@ -64,13 +67,23 @@ static HTAB *lsm_map; // maps relation Oid to control structure (lsm_entry)
 	https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/lwlock.c
 */
 static LWLock *lsm_map_lock; // lock for access to lsm_map
-static List *lsm_released_locks;
+
+/*
+	The lsm_released_locks list is used to manage the LWLocks used in the LSM extension. 
+	Whenever a process acquires a lock, it adds it to this list. 
+	When the process releases the lock, it removes it from the list.
+*/
+static List *lsm_released_locks;  
 /*
 	https://github.com/postgres/postgres/blob/master/src/include/nodes/pg_list.h
 */
 static List *lsm_entries;
-static bool lsm_copying;
-
+/*
+	lsm_copying boolean is used to indicate whether the LSM index is being copied or not.
+	Copying is performed during compaction when the LSM index is merged with another index. 
+	The lsm_copying variable is used to ensure that the background compaction process does not interfere with other operations on the LSM index.
+*/
+static bool lsm_copying;   
 // relation option kind for our index
 static relopt_kind lsm_relopt_kind;
 
@@ -210,7 +223,7 @@ static lsm_entry *lsm_get_entry(Relation index)
 	return entry;
 }
 
-// Truncate top index to 0 tuples
+// Truncate top index to 0 tuples and rebuild from scratch by scanning heap
 static void lsm_truncate_index(Oid index_oid, Oid heap_oid)
 {
 	Relation index = index_open(index_oid, AccessExclusiveLock);
@@ -320,6 +333,7 @@ static int lsm_compare_index_tuples(IndexScanDesc scan1, IndexScanDesc scan2, So
 	return ItemPointerCompare(&scan1->xs_heaptid, &scan2->xs_heaptid);
 }
 
+//create background worker process that will execute the function lsm_compactor_func() in a separate process
 static void lsm_launch_worker(lsm_entry *entry)
 {
 	BackgroundWorker worker;
@@ -375,6 +389,7 @@ static void lsm_merge_indices(Oid dest, Oid src, Oid heap_oid)
 	Oid prev_am = src_index->rd_rel->relam;
 
 	elog(LOG, "LSM: Merging top index %s with size %d blocks", RelationGetRelationName(src_index), RelationGetNumberOfBlocks(src_index));
+	elog(LOG,"Test");
 
 	base->rd_rel->relam = BTREE_AM_OID;
 	scan = index_beginscan(heap, src_index, SnapshotAny, 0, 0);
@@ -451,7 +466,7 @@ void lsm_compactor_func(Datum arg)
 			{
 				// merge with base
 				pgstat_report_activity(STATE_RUNNING, "merging indices");
-				lsm_merge_indices(entry->base, entry->top_indices[merge_index], entry->heap);
+				lsm_merge_indices(entry->base, entry->top_indices[merge_index], entry->heap); //1st arg is dest and second is src
 
 				// truncate merge index
 				pgstat_report_activity(STATE_RUNNING, "truncating");
@@ -469,6 +484,7 @@ void lsm_compactor_func(Datum arg)
 
 /*
 	Access Methods
+	Called when you first creste index using "create index <ind_name> on <rel> using lsm(<attributes>);"
 */
 
 static IndexBuildResult *
@@ -519,6 +535,7 @@ static void lsm_reacquire_locks(void)
 
 /*
 	Insert in active top index, on overflow swap active indices and start merge
+	rel->indexRel;
 */
 static bool lsm_insert(
 	Relation rel, Datum *values, bool *isNull, ItemPointer ht_ctid,
@@ -536,6 +553,7 @@ static bool lsm_insert(
 	bool is_initialized = true;
 
 	// Get current active index
+	elog(LOG, "lsm_insert called");
 	SpinLockAcquire(&entry->spinlock);
 	active_index = entry->active_index;
 	if (entry->top_indices[active_index])
@@ -627,13 +645,13 @@ static IndexScanDesc lsm_beginscan(Relation rel, int nkeys, int norderbys)
 
 	/* no order by operators */
 	Assert(norderbys == 0);
-
+	elog(LOG, "Started index scan");
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 	scan->xs_itupdesc = RelationGetDescr(rel);
 	lsd = (lsm_scan_desc *)palloc(sizeof(lsm_scan_desc));
 	lsd->entry = lsm_get_entry(rel);
 	lsd->sortKeys = lsm_build_sortkeys(rel);
-
+	elog(LOG, "Started Checking top indices");
 	for (int i = 0; i < 2; i++)
 	{
 		if (lsd->entry->top_indices[i])
@@ -647,7 +665,7 @@ static IndexScanDesc lsm_beginscan(Relation rel, int nkeys, int norderbys)
 			lsd->scan[i] = NULL;
 		}
 	}
-
+	elog(LOG, "Done Checking top indices");
 	lsd->scan[2] = btbeginscan(rel, nkeys, norderbys);
 	for (int i = 0; i < 3; i++)
 	{
@@ -658,7 +676,7 @@ static IndexScanDesc lsm_beginscan(Relation rel, int nkeys, int norderbys)
 			lsd->scan[i]->parallel_scan = NULL;
 		}
 	}
-	// lsd->unique = rel->rd_options ? ((lsm_options *)rel->rd_options)->unique : false;
+	lsd->unique = rel->rd_options ? ((lsm_options *)rel->rd_options)->unique : false;
 	lsd->curr_index = -1;
 	scan->opaque = lsd;
 
@@ -669,6 +687,7 @@ static void lsm_rescan(IndexScanDesc scan, ScanKey scanKey, int nscankeys, ScanK
 {
 	lsm_scan_desc *lsd = (lsm_scan_desc *)scan->opaque;
 	lsd->curr_index = -1;
+	elog(LOG, "LSM rescan called");
 	for (int i = 0; i < 3; i++)
 	{
 		if (lsd->scan[i])
@@ -677,12 +696,13 @@ static void lsm_rescan(IndexScanDesc scan, ScanKey scanKey, int nscankeys, ScanK
 			lsd->eoi[i] = false;
 		}
 	}
+	elog(LOG, "Done LSM rescaning");
 }
 
 static void lsm_endscan(IndexScanDesc scan)
 {
 	lsm_scan_desc *lsd = (lsm_scan_desc *)scan->opaque;
-
+	elog(LOG, "LSM endscan called");
 	for (int i = 0; i < 3; i++)
 	{
 		if (lsd->scan[i])
@@ -693,6 +713,7 @@ static void lsm_endscan(IndexScanDesc scan)
 		}
 	}
 	pfree(lsd);
+	elog(LOG, "Done LSM endscan");
 }
 
 static bool lsm_gettuple(IndexScanDesc scan, ScanDirection dir)
@@ -705,7 +726,7 @@ static bool lsm_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 	/* btree indices are not lossy */
 	scan->xs_recheck = false;
-
+	elog(LOG, "LSM gettuple called");
 	if (curr >= 0)
 		lsd->eoi[curr] = !_bt_next(lsd->scan[curr], dir); /* move forward current index */
 
@@ -717,20 +738,20 @@ static bool lsm_gettuple(IndexScanDesc scan, ScanDirection dir)
 		if (!lsd->eoi[i] && !BTScanPosIsValid(bto->currPos))
 		{
 			lsd->eoi[i] = !_bt_first(lsd->scan[i], dir);
-			// if (!lsd->eoi[i] && lsd->unique && scan->numberOfKeys == scan->indexRelation->rd_index->indnkeyatts)
-			// {
-			// 	/* If index is marked as unique and we perform lookup using all index keys,
-			// 	 * then we can stop after locating first occurrence.
-			// 	 * If make it possible to avoid lookups of all three indexes.
-			// 	 */
-			// 	elog(DEBUG1, "Lsm3: lookup %d indices", j + 1);
-			// 	while (++j < 3) /* prevent search of all remanining indexes */
-			// 	{
-			// 		lsd->eoi[try_index_order[j]] = true;
-			// 	}
-			// 	min = i;
-			// 	break;
-			// }
+			if (!lsd->eoi[i] && lsd->unique && scan->numberOfKeys == scan->indexRelation->rd_index->indnkeyatts)
+			{
+				/* If index is marked as unique and we perform lookup using all index keys,
+				 * then we can stop after locating first occurrence.
+				 * If make it possible to avoid lookups of all three indexes.
+				 */
+				elog(DEBUG1, "Lsm3: lookup %d indices", j + 1);
+				while (++j < 3) /* prevent search of all remanining indexes */
+				{
+					lsd->eoi[try_index_order[j]] = true;
+				}
+				min = i;
+				break;
+			}
 		}
 		if (!lsd->eoi[i])
 		{
@@ -942,7 +963,7 @@ static void lsm_process_utility(PlannedStmt *plannedStmt,
 
 	lsm_entries = NULL;
 	lsm_copying = false;
-
+	elog(LOG, "LSM process_utility called");
 	if (IsA(parseTree, DropStmt))
 	{
 		drop = (DropStmt *)parseTree;
@@ -982,7 +1003,7 @@ static void lsm_process_utility(PlannedStmt *plannedStmt,
 	{
 		lsm_copying = true;
 	}
-
+	elog(LOG, "Calling prev utility hook now");
 	// Call previous process utility hooks
 	(prev_process_utility_hook ? prev_process_utility_hook : standard_ProcessUtility)(
 		plannedStmt,
