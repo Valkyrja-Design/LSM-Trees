@@ -389,7 +389,6 @@ static void lsm_merge_indices(Oid dest, Oid src, Oid heap_oid)
 	Oid prev_am = src_index->rd_rel->relam;
 
 	elog(LOG, "LSM: Merging top index %s with size %d blocks", RelationGetRelationName(src_index), RelationGetNumberOfBlocks(src_index));
-	elog(LOG,"Test");
 
 	base->rd_rel->relam = BTREE_AM_OID;
 	scan = index_beginscan(heap, src_index, SnapshotAny, 0, 0);
@@ -553,7 +552,7 @@ static bool lsm_insert(
 	bool is_initialized = true;
 
 	// Get current active index
-	elog(LOG, "lsm_insert called");
+	// elog(LOG, "lsm_insert called");
 	SpinLockAcquire(&entry->spinlock);
 	active_index = entry->active_index;
 	if (entry->top_indices[active_index])
@@ -645,13 +644,13 @@ static IndexScanDesc lsm_beginscan(Relation rel, int nkeys, int norderbys)
 
 	/* no order by operators */
 	Assert(norderbys == 0);
-	elog(LOG, "Started index scan");
+	// elog(LOG, "Started index scan");
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 	scan->xs_itupdesc = RelationGetDescr(rel);
 	lsd = (lsm_scan_desc *)palloc(sizeof(lsm_scan_desc));
 	lsd->entry = lsm_get_entry(rel);
 	lsd->sortKeys = lsm_build_sortkeys(rel);
-	elog(LOG, "Started Checking top indices");
+	// elog(LOG, "Started Checking top indices");
 	for (int i = 0; i < 2; i++)
 	{
 		if (lsd->entry->top_indices[i])
@@ -665,7 +664,7 @@ static IndexScanDesc lsm_beginscan(Relation rel, int nkeys, int norderbys)
 			lsd->scan[i] = NULL;
 		}
 	}
-	elog(LOG, "Done Checking top indices");
+	// elog(LOG, "Done Checking top indices");
 	lsd->scan[2] = btbeginscan(rel, nkeys, norderbys);
 	for (int i = 0; i < 3; i++)
 	{
@@ -687,7 +686,7 @@ static void lsm_rescan(IndexScanDesc scan, ScanKey scanKey, int nscankeys, ScanK
 {
 	lsm_scan_desc *lsd = (lsm_scan_desc *)scan->opaque;
 	lsd->curr_index = -1;
-	elog(LOG, "LSM rescan called");
+	// elog(LOG, "LSM rescan called");
 	for (int i = 0; i < 3; i++)
 	{
 		if (lsd->scan[i])
@@ -696,13 +695,13 @@ static void lsm_rescan(IndexScanDesc scan, ScanKey scanKey, int nscankeys, ScanK
 			lsd->eoi[i] = false;
 		}
 	}
-	elog(LOG, "Done LSM rescaning");
+	// elog(LOG, "Done LSM rescaning");
 }
 
 static void lsm_endscan(IndexScanDesc scan)
 {
 	lsm_scan_desc *lsd = (lsm_scan_desc *)scan->opaque;
-	elog(LOG, "LSM endscan called");
+	// elog(LOG, "LSM endscan called");
 	for (int i = 0; i < 3; i++)
 	{
 		if (lsd->scan[i])
@@ -713,7 +712,7 @@ static void lsm_endscan(IndexScanDesc scan)
 		}
 	}
 	pfree(lsd);
-	elog(LOG, "Done LSM endscan");
+	// elog(LOG, "Done LSM endscan");
 }
 
 static bool lsm_gettuple(IndexScanDesc scan, ScanDirection dir)
@@ -726,7 +725,7 @@ static bool lsm_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 	/* btree indices are not lossy */
 	scan->xs_recheck = false;
-	elog(LOG, "LSM gettuple called");
+	// elog(LOG, "LSM gettuple called");
 	if (curr >= 0)
 		lsd->eoi[curr] = !_bt_next(lsd->scan[curr], dir); /* move forward current index */
 
@@ -963,7 +962,7 @@ static void lsm_process_utility(PlannedStmt *plannedStmt,
 
 	lsm_entries = NULL;
 	lsm_copying = false;
-	elog(LOG, "LSM process_utility called");
+	// elog(LOG, "LSM process_utility called");
 	if (IsA(parseTree, DropStmt))
 	{
 		drop = (DropStmt *)parseTree;
@@ -1003,7 +1002,7 @@ static void lsm_process_utility(PlannedStmt *plannedStmt,
 	{
 		lsm_copying = true;
 	}
-	elog(LOG, "Calling prev utility hook now");
+	// elog(LOG, "Calling prev utility hook now");
 	// Call previous process utility hooks
 	(prev_process_utility_hook ? prev_process_utility_hook : standard_ProcessUtility)(
 		plannedStmt,
